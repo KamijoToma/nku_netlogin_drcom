@@ -79,8 +79,6 @@ def _read_mac(name):
             return f.read().strip()
     except OSError:
         return ""
-
-
 def detect_network_info():
     """Detect local IP/MAC/IPv6 and whether we are in the unauthenticated state.
 
@@ -88,34 +86,37 @@ def detect_network_info():
     """
     info = {"ip": "", "ipv6": "", "mac": "", "blocked": None}
 
-    # Source IPv4 of the interface reaching the campus portal (UDP connect trick:
-    # no packets are actually sent).
+    # Egress interface + source IP toward the campus portal (no packets sent).
+    # `ip route get` is immune to TUN/proxy interfaces shadowing the default route.
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect((PORTAL_HOST, PORTAL_PORT))
-        info["ip"] = s.getsockname()[0]
-        s.close()
-    except OSError:
-        pass
-    if not info["ip"]:
-        return None
-
-    # MAC + global IPv6 from the OS (Linux /sys, graceful fallback).
-    try:
-        out = subprocess.run(["ip", "-o", "addr", "show"],
+        portal_ip = socket.getaddrinfo(PORTAL_HOST, PORTAL_PORT, socket.AF_INET)[0][4][0]
+        out = subprocess.run(["ip", "route", "get", portal_ip],
                              capture_output=True, text=True, timeout=3).stdout
-        for line in out.splitlines():
-            if " inet " in line and info["ip"] in line:
-                info["mac"] = _read_mac(line.split()[1])
-                break
-        for line in out.splitlines():
-            if " inet6 " in line:
-                addr = line.split()[2].split("/")[0]
-                if not addr.startswith("fe80"):
+        parts = out.split()
+        iface = parts[parts.index("dev") + 1]
+        info["ip"] = parts[parts.index("src") + 1]
+        info["mac"] = _read_mac(iface)
+        # Global IPv6 on the same interface (skip link-local fe80::/10).
+        out6 = subprocess.run(["ip", "-6", "addr", "show", "dev", iface],
+                              capture_output=True, text=True, timeout=3).stdout
+        for line in out6.splitlines():
+            p = line.split()
+            if "inet6" in p:
+                addr = p[p.index("inet6") + 1].split("/")[0]
+                if not addr.startswith("fe80") and addr not in ("::", "ff00::"):
                     info["ipv6"] = addr
                     break
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         pass
+    if not info["ip"]:
+        # Fallback: UDP connect trick (no packets actually sent).
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((PORTAL_HOST, PORTAL_PORT))
+            info["ip"] = s.getsockname()[0]
+            s.close()
+        except OSError:
+            return None
     if not info["mac"]:
         import uuid
         info["mac"] = "%012x" % uuid.getnode()
