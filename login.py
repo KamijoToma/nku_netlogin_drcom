@@ -136,7 +136,7 @@ def _read_mac(name):
         return ""
 
 
-def portal_endpoint(retries=4, retry_delay=15.0):
+def portal_endpoint(retries=15, retry_delay=20.0):
     """Return a reachable portal endpoint ('ip') on PORTAL_PORT, or None.
 
     Tries (per round): DNS result (bounded), default gateway, known campus
@@ -144,8 +144,8 @@ def portal_endpoint(retries=4, retry_delay=15.0):
     AC black-holes the client (portal included) for a short window, so the
     whole round is retried a few times before giving up.
     """
-    seen = []
-    for _ in range(retries):
+    for attempt in range(retries):
+        seen = []
         cands = []
         ip = resolve_bounded(PORTAL_HOST, PORTAL_PORT, timeout=3.0)
         if ip:
@@ -162,7 +162,9 @@ def portal_endpoint(retries=4, retry_delay=15.0):
                 return cand
             except OSError:
                 continue
-        if _ < retries - 1:
+        if attempt < retries - 1:
+            print(f"Portal unreachable (AC block window?), retrying in "
+                  f"{retry_delay:.0f}s... ({attempt + 1}/{retries - 1})")
             time.sleep(retry_delay)
     return None
 
