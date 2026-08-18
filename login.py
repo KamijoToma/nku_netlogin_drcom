@@ -94,7 +94,24 @@ def default_iface():
                 return parts[parts.index("dev") + 1]
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         pass
-    return None
+def _first_global_v4_ifaces():
+    """Interfaces with a global IPv4, virtual/bridge interfaces excluded."""
+    skip = ("docker", "veth", "br-", "tailscale", "tailscale0", "tun", "tap",
+            "Meta", "lo", "kube")
+    try:
+        out = subprocess.run(["ip", "-o", "-4", "addr", "show"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    ifaces = []
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) >= 4 and "inet" in p:
+            name = p[1]
+            if name.startswith(skip):
+                continue
+            ifaces.append(name)
+    return ifaces
 
 
 def default_gateway():
@@ -151,6 +168,9 @@ def detect_network_info():
 
     try:
         iface = default_iface()
+        if not iface:
+            alts = _first_global_v4_ifaces()
+            iface = alts[0] if alts else None
         if iface:
             info["mac"] = _read_mac(iface)
             out = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", iface],
