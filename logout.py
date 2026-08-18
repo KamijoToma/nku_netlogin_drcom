@@ -1,129 +1,84 @@
-import requests
-import time
+#!/usr/bin/env python3
+"""NKU campus network (Dr.COM ePortal) logout tool.
+
+Protocol verified live on the campus VLAN (LicheePi 4A, Aug 2026):
+
+- Endpoint:  https://netauth.nankai.edu.cn:804/eportal/portal/logout
+- Same XOR-119-hex encoding as login, plaintext suffix encrypt=1&v=1234&lang=zh
+- The REAL password is required (a dummy value does not terminate the session).
+- Success:   dr1004({"result":1,"msg":"Radius注销成功！"});
+- After a successful logout the AC black-holes the client's HTTP traffic
+  (no more 302 to the portal), so the post-logout probe expects failure/302.
+- Standard library only (no third-party dependencies).
+"""
+
 import sys
-import re
-from urllib.parse import urlparse, parse_qs
-from login import detect_network_info
+import urllib.error
+import urllib.request
 
-def get_key(secret_key):
-    ret = 0
-    for char in secret_key:
-        ret ^= ord(char)
-    return ret
+from login import SSL_CTX, detect_network_info, enc_pwd, get_key, jsonp_body, probe_blocked
 
-def enc_pwd(password, key):
-    pass_out = ""
-    if not password:
-        return pass_out
-    for char in str(password):
-        ch = ord(char) ^ key
-        hex_str = hex(ch)[2:]
-        if len(hex_str) == 1:
-            hex_str = "0" + hex_str
-        pass_out += hex_str
-    return pass_out
+LOGOUT_URL = "https://netauth.nankai.edu.cn:804/eportal/portal/logout"
 
-def logout():
-    # 1. Get Network Info
+
+def logout(username, password):
     info = detect_network_info()
-    
-    ip = ""
-    mac = ""
-    uid = "drcom" # Default
-    
-    if not info:
-        print("Redirection not detected. Trying to fetch account page to get info...")
-        try:
-            resp = requests.get("https://netauth.nankai.edu.cn/", verify=False, timeout=10)
-            content = resp.text
-            
-            ip_match = re.search(r"v4ip='([^']+)'", content)
-            uid_match = re.search(r"uid='([^']+)'", content)
-            
-            if ip_match:
-                ip = ip_match.group(1)
-                print(f"Found IP from account page: {ip}")
-            
-            if uid_match:
-                uid = uid_match.group(1)
-                print(f"Found UID (Username) from account page: {uid}")
-                
-        except Exception as e:
-            print(f"Error fetching account page: {e}")
-    else:
-        ip = info["wlan_user_ip"]
-        mac = info["wlan_user_mac"]
-        # If we are redirected, we are not logged in, so logout is moot, but maybe we want to clear session?
-        pass
+    if info is None:
+        print("Error: could not determine local IP. Are you on the campus network?")
+        return 1
 
-    if not ip:
-        print("Error: Could not determine IP address. Logout might fail.")
-    
-    if not mac:
-        mac = "000000000000"
+    print(f"Detected: ip={info['ip']} mac={info['mac']} blocked={info['blocked']}")
+    if info["blocked"]:
+        print("Already unauthenticated; sending logout anyway (no-op safe).")
 
-    # 2. Prepare Params
-    # Based on logout.sh analysis
-    
-    # Key for encryption
-    secret_key = 'drcom'
-    key = get_key(secret_key) # 119
-    
-    raw_params = {
-        "callback": "dr1004",
-        "login_method": "1",
-        "user_account": uid, 
-        "user_password": "123", # Dummy password
-        "ac_logout": "1",
-        "register_mode": "1",
-        "wlan_user_ip": ip,
-        "wlan_user_ipv6": "",
-        "wlan_vlan_id": "1",
-        "wlan_user_mac": mac,
-        "wlan_ac_ip": "",
-        "wlan_ac_name": "",
-        "jsVersion": "4.3"
-    }
-    
-    encrypted_params = {}
-    for k, v in raw_params.items():
-        encrypted_params[k] = enc_pwd(v, key)
-        
-    # Add non-encrypted params
-    encrypted_params["encrypt"] = "1"
-    encrypted_params["v"] = str(int(time.time())) 
-    encrypted_params["lang"] = "zh"
-    
-    url = "https://netauth.nankai.edu.cn:804/eportal/portal/logout"
-    
-    print(f"Sending logout request to {url}...")
-    print(f"User: {uid}, IP: {ip}, MAC: {mac}")
-    
+    key = get_key("drcom")  # 119
+    params = [
+        ("callback", "dr1004"),
+        ("login_method", "1"),
+        ("user_account", username),
+        ("user_password", password),
+        ("ac_logout", "1"),
+        ("register_mode", "1"),
+        ("wlan_user_ip", info["ip"]),
+        ("wlan_user_ipv6", info["ipv6"]),
+        ("wlan_vlan_id", "1"),
+        ("wlan_user_mac", info["mac"]),
+        ("wlan_ac_ip", ""),
+        ("wlan_ac_name", ""),
+        ("jsVersion", "4.3"),
+    ]
+    qs = "&".join(f"{k}={enc_pwd(v, key)}" for k, v in params) + "&encrypt=1&v=1234&lang=zh"
+    url = LOGOUT_URL + "?" + qs
+
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://netauth.nankai.edu.cn/"
-        }
-        response = requests.get(url, params=encrypted_params, headers=headers, verify=False, timeout=10)
-        print(f"Status Code: {response.status_code}")
-        print(f"Response: {response.text}")
-        
-        if "result" in response.text or response.status_code == 200:
-             print("Logout request sent.")
-             
-    except Exception as e:
-        print(f"Error during logout: {e}")
+        with urllib.request.urlopen(url, timeout=10, context=SSL_CTX) as r:
+            body = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as e:
+        print(f"Error: {e}")
+        return 1
 
-    # Verify
-    print("Verifying logout...")
-    try:
-        check = requests.get("http://www.baidu.com", allow_redirects=False, timeout=5)
-        if check.status_code == 302:
-            print("Logout verified: Redirect detected.")
+    data = jsonp_body(body)
+    if data is None:
+        print(f"Unexpected response: {body[:200]}")
+        return 1
+    msg = data.get("msg", "")
+    print(f"Response: {msg}")
+    if data.get("result") == 1 and "注销成功" in msg:
+        print("Logout succeeded.")
+        if probe_blocked():
+            print("Verified: traffic is no longer passed through.")
         else:
-            print("Logout verification failed: No redirect detected.")
-    except Exception as e:
-        print(f"Verification error: {e}")
+            print("Warning: traffic is still being passed through; "
+                  "the AC may take a moment to apply the CoA.")
+        return 0
+    print("Logout failed (no active session or bad credentials).")
+    return 1
+
 
 if __name__ == "__main__":
-    logout()
+    if len(sys.argv) != 3:
+        print("Usage: python3 logout.py <username> <password>")
+        sys.exit(1)
+    sys.exit(logout(sys.argv[1], sys.argv[2]))

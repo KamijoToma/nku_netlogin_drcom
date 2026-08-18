@@ -1,91 +1,88 @@
 # NKU NetLogin
 
-南开大学校园网认证系统（ePortal）自动登录/登出工具。支持身份验证、网络状态检查和会话管理。
+南开大学校园网认证系统（ePortal）自动登录/登出工具。协议已在校内实测验证（2026-08，LicheePi 4A）。
 
 ## 项目简介
 
-这是一套针对南开大学校园网 ePortal 认证系统的 Python 实现工具。通过逆向工程原生 JavaScript 认证流程，提供了自动化的登录、登出和状态检查功能。
+针对南开大学校园网 Dr.COM/ePortal 认证系统的 Python 实现工具。通过逆向门户 JavaScript 并在校园网 VLAN 内实测，提供自动化的登录、登出和网络状态检测。
 
 **主要特性：**
-- 🔐 自动检测网络信息（IP、MAC 地址等）
-- ✅ 支持自动登录和登出
-- 📊 查询在线连接状态
-- 🔒 安全的密码加密（XOR 算法）
-- 🌐 兼容 ePortal 认证门户
+- 🐧 纯标准库实现，无第三方依赖（不需要 `pip install`）
+- 📶 本地自动检测 IP / MAC / IPv6，无需解析重定向 URL
+- ✅ 登录：ePortal `portal/login` API（XOR-119 加密），成功/失败均有明确判定
+- 🚪 登出：ePortal `portal/logout` API（需真实密码），成功后验证流量放行状态
+- 🔍 认证状态探测（在线 / 拦截中 / 硬封禁）
 
 ## 文件说明
 
 | 文件 | 功能 |
 |------|------|
-| `login.py` | 登录认证脚本 |
+| `login.py` | 登录脚本（同时提供共享的检测/加密函数） |
 | `logout.py` | 登出脚本 |
-| `status.py` | 检查在线状态脚本 |
-| `get_config_v2.py` | 获取认证配置 |
-| `TECHNICAL_DOCS.md` | 详细的技术文档 |
+| `TECHNICAL_DOCS.md` | 详细技术文档（含实测协议、响应格式、已知坑） |
 
 ## 快速开始
 
-### 安装依赖
-
-```bash
-pip install requests
-```
-
-### 使用示例
+无需安装依赖（Python 3.6+，macOS/Linux 均可运行，MAC 检测以 Linux 为主）。
 
 #### 登录
 ```bash
-python login.py yourusername yourpassword
+python3 login.py <学号> <密码>
 ```
+成功时输出 `Login succeeded.`（响应 msg 为 `Welcome to Drcom System:<NAS IP>`）。
 
 #### 登出
-登出功能目前不可用，疑似南开没有实现登出功能。
 ```bash
-python logout.py
+python3 logout.py <学号> <密码>
 ```
+成功时输出 `Logout succeeded.`（响应 `{"result":1,"msg":"Radius注销成功！"}`），并验证流量已停止放行。
 
+#### 示例
+```bash
+python3 login.py <学号> <密码>
+python3 logout.py <学号> <密码>
+```
 
 ## 技术细节
 
 ### 认证流程
-
-1. **网络探测** - 访问外部 HTTP 网址触发门户重定向
-2. **参数提取** - 从重定向 URL 解析认证所需参数
-3. **密码加密** - 使用 XOR 算法加密用户密码
-4. **发送请求** - 向认证服务器发送 JSONP 请求
-5. **验证响应** - 检查认证结果
+1. **本地检测** - UDP connect 取校园网出口 IP，`/sys/class/net` 取 MAC
+2. **状态探测** - 请求 `http://www.baidu.com`（不跟随重定向）：200=在线，302=未认证，连接失败=封禁
+3. **参数加密** - 所有参数值用 XOR（密钥 119）逐字符异或后转 2 位小写 hex
+4. **发送请求** - GET 门户 API（JSONP 响应）
+5. **验证响应** - 解析 JSONP 中的 JSON，按 `msg` / `result` 判定结果
 
 ### 密码加密算法
-
-使用固定密钥 `119` 的 XOR 加密：
+固定密钥 `119`（`'d'^'r'^'c'^'o'^'m'`）的 XOR 加密：
 
 ```python
-def enc_pwd(password, key=119):
-    return "".join([
-        hex(ord(c) ^ key)[2:].zfill(2) 
-        for c in password
-    ])
+def enc_pwd(value, key=119):
+    return "".join(f"{ord(c) ^ key:02x}" for c in str(value)) if value else ""
 ```
 
-### 核心参数
+### 核心接口
+- 登录: `https://netauth.nankai.edu.cn:804/eportal/portal/login`
+- 登出: `https://netauth.nankai.edu.cn:804/eportal/portal/logout`
+- 明文后缀: `encrypt=1&v=1234&lang=zh`
 
-- `wlanuserip` - 用户 IP 地址
-- `wlanacname` - AC 设备名称
-- `wlan_user_mac` - 用户 MAC 地址
-- `jsVersion` - 认证版本号
-
-详见 [TECHNICAL_DOCS.md](TECHNICAL_DOCS.md)
+详见 [TECHNICAL_DOCS.md](TECHNICAL_DOCS.md)（含旧版 :801 端点、MAC 封禁处理等实测细节）。
 
 ## 常见问题
 
-### Q: 登录失败提示 "No redirection detected"？
-A: 需要连接到南开大学校园网，或检查网络连接状态。
+### Q: 登录失败 "统一身份认证验证失败"？
+A: 密码错误，或已有活动会话（重复登录）。先 `logout.py` 再登录。账号必须是纯学号，
+不要带邮箱后缀（`@nankai.edu.cn` 形式会被拒绝）。
+
+### Q: 所有请求都无响应（含门户本身）？
+A: 连续多次登录失败会触发 AC 对 MAC 的应用层封禁。Linux 下更换 MAC 地址重新获取 DHCP 即可解除，
+详见 TECHNICAL_DOCS.md 第 7 节。
 
 ### Q: 如何处理 SSL 证书警告？
-A: 脚本中已配置 `verify=False` 以跳过 SSL 验证。生产环境建议添加正确的证书。
+A: 脚本已用 `ssl.CERT_NONE` 跳过证书验证（校内门户证书不受公共 CA 信任）。
 
-### Q: 支持 IPv6？
-A: 部分接口支持 IPv6，但主要功能面向 IPv4。
+### Q: 在 macOS 上运行？
+A: 可以（IP 探测为跨平台实现；MAC 检测在无 `/sys` 时回退到 `uuid.getnode()`，
+可能与网卡实际 MAC 不一致，登出可能不生效）。
 
 ## 安全性提示
 
@@ -95,26 +92,6 @@ A: 部分接口支持 IPv6，但主要功能面向 IPv4。
 - 此工具仅供个人学习和网络维护使用
 - 遵守学校网络使用政策
 
-## 环境要求
-
-- Python 3.6+
-- requests 库
-- 互联网连接（用于网络探测）
-
 ## 许可证
 
 MIT License
-
-## 致谢
-
-感谢所有为此项目贡献代码和文档的开发者。
-
-Webportal 技术探测和实现：Google Gemini 3 Flash
-
----
-
-**相关资源：**
-- [南开大学网络信息技术中心](https://www.nankai.edu.cn/)
-- [技术文档详解](TECHNICAL_DOCS.md)
-
-如有问题，欢迎提交 Issue 或 Pull Request。

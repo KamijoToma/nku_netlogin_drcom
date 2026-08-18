@@ -1,11 +1,41 @@
+#!/usr/bin/env python3
+"""NKU campus network (Dr.COM ePortal) login tool.
 
-import requests
-import hashlib
-import sys
-import time
+Protocol verified live on the campus VLAN (LicheePi 4A, Aug 2026):
+
+- Endpoint:  https://netauth.nankai.edu.cn:804/eportal/portal/login
+- Every parameter value is XOR-119-hex encoded (key = 'd'^'r'^'c'^'o'^'m' = 0x77),
+  followed by the plaintext suffix  encrypt=1&v=1234&lang=zh
+- Success:   dr1003({"result":0,"msg":"Welcome to Drcom System:<nas>","ret_code":1});
+- Failure:   msg "统一身份认证验证失败" (wrong password)
+             or "无法获取用户认证账号!" (account not found / undecodable)
+- The account is the plain student ID (e.g. 1234567890); email forms are rejected.
+- Standard library only (no third-party dependencies).
+"""
+
+import json
 import re
-from urllib.parse import urlparse, parse_qs
-import base64
+import socket
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+PORTAL_HOST = "netauth.nankai.edu.cn"
+PORTAL_PORT = 804
+LOGIN_URL = f"https://{PORTAL_HOST}:{PORTAL_PORT}/eportal/portal/login"
+PROBE_URL = "http://www.baidu.com"
+
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
 
 def get_key(secret_key):
     ret = 0
@@ -13,138 +43,139 @@ def get_key(secret_key):
         ret ^= ord(char)
     return ret
 
-def enc_pwd(password, key):
-    pass_out = ""
-    if not password:
-        return pass_out
-    for char in str(password):
-        ch = ord(char) ^ key
-        hex_str = hex(ch)[2:]
-        if len(hex_str) == 1:
-            hex_str = "0" + hex_str
-        pass_out += hex_str
-    return pass_out
 
-def calc_md5(password):
-    pid = '1'
-    calg = '12345678'
-    tmp = pid + password + calg
-    md5_hash = hashlib.md5(tmp.encode()).hexdigest()
-    return md5_hash + calg + pid
+def enc_pwd(value, key):
+    """XOR each character of value with key, return lowercase hex (empty stays empty)."""
+    if not value:
+        return ""
+    return "".join(f"{ord(c) ^ key:02x}" for c in str(value))
+
+
+def jsonp_body(text):
+    """Parse the JSON object out of a JSONP response like dr1003({...});"""
+    m = re.search(r"\((\{.*\})\)", text, re.S)
+    return json.loads(m.group(1)) if m else None
+
+
+def probe_blocked():
+    """True when the AC is intercepting (302) or black-holing traffic.
+
+    False means the client is currently passed through (online).
+    """
+    opener = urllib.request.build_opener(_NoRedirect())
+    req = urllib.request.Request(PROBE_URL, headers={"User-Agent": "curl/8.0"})
+    try:
+        opener.open(req, timeout=5)
+        return False
+    except urllib.error.HTTPError as e:
+        return e.code == 302
+    except (urllib.error.URLError, OSError):
+        return True
+
+
+def _read_mac(name):
+    try:
+        with open(f"/sys/class/net/{name}/address") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
 
 def detect_network_info():
-    print("Detecting network info...")
+    """Detect local IP/MAC/IPv6 and whether we are in the unauthenticated state.
+
+    Returns {"ip", "ipv6", "mac", "blocked"} or None if the IP could not be found.
+    """
+    info = {"ip": "", "ipv6": "", "mac": "", "blocked": None}
+
+    # Source IPv4 of the interface reaching the campus portal (UDP connect trick:
+    # no packets are actually sent).
     try:
-        # Use a non-HTTPS URL to trigger portal redirection
-        response = requests.get("http://www.baidu.com", allow_redirects=False, timeout=5)
-        if response.status_code == 302 and "Location" in response.headers:
-            location = response.headers["Location"]
-            print(f"Redirected to: {location}")
-            parsed = urlparse(location)
-            qs = parse_qs(parsed.query)
-            
-            info = {
-                "wlan_user_ip": qs.get("wlanuserip", [""])[0],
-                "wlan_ac_name": qs.get("wlanacname", [""])[0],
-                "wlan_ac_ip": qs.get("nasip", [""])[0],
-                "wlan_user_mac": qs.get("wlanusermac", ["000000000000"])[0] 
-            }
-            if not info["wlan_user_mac"]:
-                 info["wlan_user_mac"] = "000000000000"
-                 
-            print(f"Detected info: {info}")
-            return info
-        else:
-            print("No redirection detected. You might be already logged in or not connected to the campus network.")
-            return None
-    except Exception as e:
-        print(f"Error detecting network info: {e}")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((PORTAL_HOST, PORTAL_PORT))
+        info["ip"] = s.getsockname()[0]
+        s.close()
+    except OSError:
+        pass
+    if not info["ip"]:
         return None
 
-def login(username, password, enable_md5=False):
-    info = detect_network_info()
-    if not info:
-        print("Using fallback values...")
-        # NOTE: Fallback values - will be overridden if network redirection is detected
-        ip = "0.0.0.0"
-        mac = "000000000000"
-        wlanacname = ""
-    else:
-        ip = info["wlan_user_ip"]
-        mac = info["wlan_user_mac"]
-        wlanacname = info["wlan_ac_name"]
-    
-    if enable_md5:
-        upass = calc_md5(password)
-        r2 = '1'
-    else:
-        upass = password
-        r2 = ''
-
-    url = "https://netauth.nankai.edu.cn:804/eportal/portal/login"
-    
-    params = {
-        "callback": "dr" + str(int(time.time())),
-        "DDDDD": username,
-        "upass": upass,
-        "0MKKey": "123456",
-        "R1": "0",
-        "R2": r2,
-        "R3": "0",
-        "R6": "0",
-        "para": "00",
-        "v6ip": "",
-        "terminal_type": "1",
-        "lang": "zh-cn",
-        "jsVersion": "4.1",
-        "v": str(int(time.time())),
-    }
-    
-    extra_params = {
-        "user_account": username,
-        "user_password": password,
-        "wlan_user_ip": ip,
-        "wlan_user_ipv6": "",
-        "wlan_user_mac": mac,
-        "wlan_ac_ip": "", 
-        "wlan_ac_name": wlanacname,
-        "jsVersion": "4.1",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    
-    params.update(extra_params)
-    
-    # Encryption logic
-    secret_key = 'drcom'
-    key = get_key(secret_key)
-    
-    encrypted_params = {}
-    for k, v in params.items():
-        if k == "callback" or k == "v": 
-            pass
-        encrypted_params[k] = enc_pwd(v, key)
-        
-    encrypted_params['encrypt'] = '1'
-    
-    final_params = encrypted_params
-    final_params['v'] = str(int(time.time()))
-    
-    print(f"Logging in to {url} with user {username}...")
+    # MAC + global IPv6 from the OS (Linux /sys, graceful fallback).
     try:
-        response = requests.get(url, params=final_params, verify=False)
-        print(f"Status Code: {response.status_code}")
-        print(f"Response: {response.text}")
-        
-        if "result" in response.text:
-             print("Login request sent.")
-    except Exception as e:
+        out = subprocess.run(["ip", "-o", "addr", "show"],
+                             capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            if " inet " in line and info["ip"] in line:
+                info["mac"] = _read_mac(line.split()[1])
+                break
+        for line in out.splitlines():
+            if " inet6 " in line:
+                addr = line.split()[2].split("/")[0]
+                if not addr.startswith("fe80"):
+                    info["ipv6"] = addr
+                    break
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not info["mac"]:
+        import uuid
+        info["mac"] = "%012x" % uuid.getnode()
+    info["mac"] = info["mac"].replace(":", "").lower()
+
+    info["blocked"] = probe_blocked()
+    return info
+
+
+def login(username, password):
+    info = detect_network_info()
+    if info is None:
+        print("Error: could not determine local IP. Are you on the campus network?")
+        return 1
+
+    print(f"Detected: ip={info['ip']} ipv6={info['ipv6']} mac={info['mac']} "
+          f"blocked={info['blocked']}")
+    if not info["blocked"]:
+        print("Already online; sending login anyway (session refresh).")
+
+    key = get_key("drcom")  # 119
+    params = [
+        ("callback", "dr1003"),
+        ("login_method", "1"),
+        ("user_account", username),
+        ("user_password", password),
+        ("wlan_user_ip", info["ip"]),
+        ("wlan_user_ipv6", info["ipv6"]),
+        ("wlan_user_mac", info["mac"]),
+        ("wlan_ac_ip", ""),
+        ("wlan_ac_name", ""),
+        ("jsVersion", "4.3"),
+    ]
+    qs = "&".join(f"{k}={enc_pwd(v, key)}" for k, v in params) + "&encrypt=1&v=1234&lang=zh"
+    url = LOGIN_URL + "?" + qs
+
+    try:
+        with urllib.request.urlopen(url, timeout=10, context=SSL_CTX) as r:
+            body = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as e:
         print(f"Error: {e}")
+        return 1
+
+    data = jsonp_body(body)
+    if data is None:
+        print(f"Unexpected response: {body[:200]}")
+        return 1
+    msg = data.get("msg", "")
+    print(f"Response: {msg}")
+    if msg.startswith("Welcome to Drcom System"):
+        print("Login succeeded.")
+        return 0
+    print("Login failed.")
+    return 1
+
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python login.py <username> <password>")
+    if len(sys.argv) != 3:
+        print("Usage: python3 login.py <username> <password>")
         sys.exit(1)
-    
-    username = sys.argv[1]
-    password = sys.argv[2]
-    login(username, password)
+    sys.exit(login(sys.argv[1], sys.argv[2]))
