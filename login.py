@@ -136,28 +136,35 @@ def _read_mac(name):
         return ""
 
 
-def portal_endpoint():
-    """Return 'host-or-ip' to reach the portal on PORTAL_PORT (never blocks long).
+def portal_endpoint(retries=4, retry_delay=15.0):
+    """Return a reachable portal endpoint ('ip') on PORTAL_PORT, or None.
 
-    Prefers DNS (bounded); falls back to TCP-probed candidate IPs:
-    default gateway first (the AC often answers on its gateway address),
-    then known campus/public portal IPs.
+    Tries (per round): DNS result (bounded), default gateway, known campus
+    and public portal IPs -- each with a short TCP probe. After a logout the
+    AC black-holes the client (portal included) for a short window, so the
+    whole round is retried a few times before giving up.
     """
-    ip = resolve_bounded(PORTAL_HOST, PORTAL_PORT, timeout=3.0)
-    if ip:
-        return ip
-    cands = [default_gateway()] + PORTAL_IP_CANDIDATES
-    for cand in cands:
-        if not cand:
-            continue
-        try:
-            s = socket.create_connection((cand, PORTAL_PORT), timeout=2)
-            s.close()
-            return cand
-        except OSError:
-            continue
+    seen = []
+    for _ in range(retries):
+        cands = []
+        ip = resolve_bounded(PORTAL_HOST, PORTAL_PORT, timeout=3.0)
+        if ip:
+            cands.append(ip)
+        cands.append(default_gateway())
+        cands.extend(PORTAL_IP_CANDIDATES)
+        for cand in cands:
+            if not cand or cand in seen:
+                continue
+            seen.append(cand)
+            try:
+                s = socket.create_connection((cand, PORTAL_PORT), timeout=2)
+                s.close()
+                return cand
+            except OSError:
+                continue
+        if _ < retries - 1:
+            time.sleep(retry_delay)
     return None
-
 
 def detect_network_info():
     """Detect local IP/MAC/IPv6 and whether we are in the unauthenticated state.
