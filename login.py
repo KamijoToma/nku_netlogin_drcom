@@ -6,7 +6,8 @@ Protocol verified live on the campus VLAN (LicheePi 4A, Aug 2026):
 - Endpoint:  https://netauth.nankai.edu.cn:804/eportal/portal/login
 - Every parameter value is XOR-119-hex encoded (key = 'd'^'r'^'c'^'o'^'m' = 0x77),
   followed by the plaintext suffix  encrypt=1&v=1234&lang=zh
-- Success:   dr1003({"result":0,"msg":"Welcome to Drcom System:<nas>","ret_code":1});
+- Success:   dr1003({"result":0,"msg":"Welcome to Drcom System:<nas>","ret_code":1})
+             or msg "Portal协议认证成功!" (session-refresh style login)
 - Failure:   msg "统一身份认证验证失败" (wrong password)
              or "无法获取用户认证账号!" (account not found / undecodable)
 - The account is the plain student ID (e.g. 1234567890); email forms are rejected.
@@ -299,7 +300,7 @@ def login(username, password):
         return 1
     msg = data.get("msg", "")
     print(f"Response: {msg}")
-    if msg.startswith("Welcome to Drcom System"):
+    if msg.startswith("Welcome to Drcom System") or "认证成功" in msg:
         print("Login succeeded.")
         return 0
     print("Login failed.")
