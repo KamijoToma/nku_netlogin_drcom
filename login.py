@@ -10,7 +10,8 @@ Protocol verified live on the campus VLAN (LicheePi 4A, Aug 2026):
 - Failure:   msg "统一身份认证验证失败" (wrong password)
              or "无法获取用户认证账号!" (account not found / undecodable)
 - The account is the plain student ID (e.g. 1234567890); email forms are rejected.
-- Standard library only (no third-party dependencies).
+- Standard library only (no third-party dependencies). Never hangs on DNS:
+  all name resolution runs in a bounded daemon thread.
 """
 
 import json
@@ -19,13 +20,19 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 
 PORTAL_HOST = "netauth.nankai.edu.cn"
 PORTAL_PORT = 804
-LOGIN_URL = f"https://{PORTAL_HOST}:{PORTAL_PORT}/eportal/portal/login"
-PROBE_URL = "http://www.baidu.com"
+LOGIN_PATH = "/eportal/portal/login"
+PROBE_HOST = "www.baidu.com"
+
+# Known portal IPs used when DNS is unreachable (e.g. AC black-holes it):
+# campus-internal AC gateway, public VIP.
+PORTAL_IP_CANDIDATES = ["198.18.0.7", "222.30.38.234"]
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -57,20 +64,51 @@ def jsonp_body(text):
     return json.loads(m.group(1)) if m else None
 
 
-def probe_blocked():
-    """True when the AC is intercepting (302) or black-holing traffic.
+def resolve_bounded(host, port, timeout=3.0):
+    """Resolve host to an IPv4 with a hard time budget (returns None on timeout).
 
-    False means the client is currently passed through (online).
+    The system resolver can block indefinitely when the AC black-holes DNS,
+    so the lookup runs in a daemon thread.
     """
-    opener = urllib.request.build_opener(_NoRedirect())
-    req = urllib.request.Request(PROBE_URL, headers={"User-Agent": "curl/8.0"})
+    result = []
+    def lookup():
+        try:
+            result.append(socket.getaddrinfo(host, port, socket.AF_INET)[0][4][0])
+        except OSError:
+            pass
+    threading.Thread(target=lookup, daemon=True).start()
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if result:
+            return result[0]
+        time.sleep(0.1)
+    return None
+def default_iface():
+    """Name of the interface carrying the default route (None if unavailable)."""
     try:
-        opener.open(req, timeout=5)
-        return False
-    except urllib.error.HTTPError as e:
-        return e.code == 302
-    except (urllib.error.URLError, OSError):
-        return True
+        route = subprocess.run(["ip", "route"],
+                               capture_output=True, text=True, timeout=3).stdout
+        for line in route.splitlines():
+            if line.startswith("default"):
+                parts = line.split()
+                return parts[parts.index("dev") + 1]
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        pass
+    return None
+
+
+def default_gateway():
+    try:
+        route = subprocess.run(["ip", "route"],
+                               capture_output=True, text=True, timeout=3).stdout
+        for line in route.splitlines():
+            if line.startswith("default"):
+                parts = line.split()
+                if "via" in parts:
+                    return parts[parts.index("via") + 1]
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        pass
+    return None
 
 
 def _read_mac(name):
@@ -79,6 +117,31 @@ def _read_mac(name):
             return f.read().strip()
     except OSError:
         return ""
+
+
+def portal_endpoint():
+    """Return 'host-or-ip' to reach the portal on PORTAL_PORT (never blocks long).
+
+    Prefers DNS (bounded); falls back to TCP-probed candidate IPs:
+    default gateway first (the AC often answers on its gateway address),
+    then known campus/public portal IPs.
+    """
+    ip = resolve_bounded(PORTAL_HOST, PORTAL_PORT, timeout=3.0)
+    if ip:
+        return ip
+    cands = [default_gateway()] + PORTAL_IP_CANDIDATES
+    for cand in cands:
+        if not cand:
+            continue
+        try:
+            s = socket.create_connection((cand, PORTAL_PORT), timeout=2)
+            s.close()
+            return cand
+        except OSError:
+            continue
+    return None
+
+
 def detect_network_info():
     """Detect local IP/MAC/IPv6 and whether we are in the unauthenticated state.
 
@@ -86,32 +149,34 @@ def detect_network_info():
     """
     info = {"ip": "", "ipv6": "", "mac": "", "blocked": None}
 
-    # Egress interface + source IP toward the campus portal (no packets sent).
-    # `ip route get` is immune to TUN/proxy interfaces shadowing the default route.
     try:
-        portal_ip = socket.getaddrinfo(PORTAL_HOST, PORTAL_PORT, socket.AF_INET)[0][4][0]
-        out = subprocess.run(["ip", "route", "get", portal_ip],
-                             capture_output=True, text=True, timeout=3).stdout
-        parts = out.split()
-        iface = parts[parts.index("dev") + 1]
-        info["ip"] = parts[parts.index("src") + 1]
-        info["mac"] = _read_mac(iface)
-        # Global IPv6 on the same interface (skip link-local fe80::/10).
-        out6 = subprocess.run(["ip", "-6", "addr", "show", "dev", iface],
-                              capture_output=True, text=True, timeout=3).stdout
-        for line in out6.splitlines():
-            p = line.split()
-            if "inet6" in p:
-                addr = p[p.index("inet6") + 1].split("/")[0]
-                if not addr.startswith("fe80") and addr not in ("::", "ff00::"):
-                    info["ipv6"] = addr
+        iface = default_iface()
+        if iface:
+            info["mac"] = _read_mac(iface)
+            out = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", iface],
+                                 capture_output=True, text=True, timeout=3).stdout
+            for line in out.splitlines():
+                p = line.split()
+                if "inet" in p:
+                    info["ip"] = p[p.index("inet") + 1].split("/")[0]
                     break
+            # Global IPv6 on the same interface (skip link-local fe80::/10).
+            out6 = subprocess.run(["ip", "-o", "-6", "addr", "show", "dev", iface],
+                                  capture_output=True, text=True, timeout=3).stdout
+            for line in out6.splitlines():
+                p = line.split()
+                if "inet6" in p:
+                    addr = p[p.index("inet6") + 1].split("/")[0]
+                    if not addr.startswith("fe80") and addr not in ("::", "ff00::"):
+                        info["ipv6"] = addr
+                        break
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         pass
     if not info["ip"]:
-        # Fallback: UDP connect trick (no packets actually sent).
+        # Fallback (no `ip` binary, e.g. macOS): UDP connect trick (no packets sent).
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(3)
             s.connect((PORTAL_HOST, PORTAL_PORT))
             info["ip"] = s.getsockname()[0]
             s.close()
@@ -124,6 +189,43 @@ def detect_network_info():
 
     info["blocked"] = probe_blocked()
     return info
+
+
+def probe_blocked():
+    """True when the AC is intercepting (302) or black-holing traffic.
+
+    False means the client is currently passed through (online).
+    Resolves the probe host with a bounded wait; on DNS failure assumes blocked.
+    """
+    ip = resolve_bounded(PROBE_HOST, 80, timeout=3.0)
+    if not ip:
+        return True
+    opener = urllib.request.build_opener(_NoRedirect())
+    req = urllib.request.Request(f"http://{ip}/", headers={"User-Agent": "curl/8.0"})
+    try:
+        opener.open(req, timeout=4)
+        return False
+    except urllib.error.HTTPError as e:
+        return e.code == 302
+    except (urllib.error.URLError, OSError):
+        return True
+
+
+def http_get(url, timeout=10):
+    """GET url (TLS verified-False); returns body text or raises OSError."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout, context=SSL_CTX) as r:
+            return r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.read().decode("utf-8", "replace")
+
+
+def portal_url(path, qs):
+    """Build the portal URL on a reachable endpoint (DNS or fallback IP)."""
+    host = portal_endpoint()
+    if not host:
+        return None
+    return f"https://{host}:{PORTAL_PORT}{path}?{qs}"
 
 
 def login(username, password):
@@ -151,13 +253,13 @@ def login(username, password):
         ("jsVersion", "4.3"),
     ]
     qs = "&".join(f"{k}={enc_pwd(v, key)}" for k, v in params) + "&encrypt=1&v=1234&lang=zh"
-    url = LOGIN_URL + "?" + qs
+    url = portal_url(LOGIN_PATH, qs)
+    if not url:
+        print("Error: portal unreachable (DNS and known IPs failed).")
+        return 1
 
     try:
-        with urllib.request.urlopen(url, timeout=10, context=SSL_CTX) as r:
-            body = r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")
+        body = http_get(url)
     except (urllib.error.URLError, OSError) as e:
         print(f"Error: {e}")
         return 1

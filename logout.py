@@ -14,11 +14,11 @@ Protocol verified live on the campus VLAN (LicheePi 4A, Aug 2026):
 
 import sys
 import urllib.error
-import urllib.request
 
-from login import SSL_CTX, detect_network_info, enc_pwd, get_key, jsonp_body, probe_blocked
+from login import (PORTAL_PORT, detect_network_info, enc_pwd, get_key, http_get,
+                   jsonp_body, portal_url, probe_blocked)
 
-LOGOUT_URL = "https://netauth.nankai.edu.cn:804/eportal/portal/logout"
+LOGOUT_PATH = "/eportal/portal/logout"
 
 
 def logout(username, password):
@@ -48,13 +48,13 @@ def logout(username, password):
         ("jsVersion", "4.3"),
     ]
     qs = "&".join(f"{k}={enc_pwd(v, key)}" for k, v in params) + "&encrypt=1&v=1234&lang=zh"
-    url = LOGOUT_URL + "?" + qs
+    url = portal_url(LOGOUT_PATH, qs)
+    if not url:
+        print("Error: portal unreachable (DNS and known IPs failed).")
+        return 1
 
     try:
-        with urllib.request.urlopen(url, timeout=10, context=SSL_CTX) as r:
-            body = r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")
+        body = http_get(url)
     except (urllib.error.URLError, OSError) as e:
         print(f"Error: {e}")
         return 1
