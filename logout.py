@@ -14,8 +14,8 @@ Protocol verified live on the campus VLAN (LicheePi 4A, Aug 2026):
 
 import sys
 
-from login import (detect_network_info, enc_pwd, get_key, jsonp_body,
-                   portal_request, probe_blocked)
+from login import (cli_credentials, detect_network_info, enc_pwd, get_key,
+                   jsonp_body, portal_request, probe_blocked)
 
 LOGOUT_PATH = "/eportal/portal/logout"
 
@@ -71,7 +71,9 @@ def logout(username, password):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
+    username, password = cli_credentials(sys.argv)
+    if not username or not password:
         print("Usage: python3 logout.py <username> <password>")
+        print("   or: NKU_USERNAME=... NKU_PASSWORD=... python3 logout.py")
         sys.exit(1)
-    sys.exit(logout(sys.argv[1], sys.argv[2]))
+    sys.exit(logout(username, password))

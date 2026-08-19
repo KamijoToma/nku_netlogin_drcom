@@ -17,6 +17,7 @@ Protocol verified live on the campus VLAN (LicheePi 4A, Aug 2026):
 
 import ipaddress
 import json
+import os
 import re
 import socket
 import ssl
@@ -397,8 +398,24 @@ def login(username, password):
     return 1
 
 
+def cli_credentials(argv):
+    """(username, password) from argv, falling back to NKU_USERNAME/NKU_PASSWORD.
+
+    argv takes precedence; (None, None) when neither source provides both,
+    or when extra positional arguments are given (mirrors the original
+    exact-argc CLI contract).
+    """
+    if len(argv) > 3:
+        return None, None
+    user = argv[1] if len(argv) > 1 else os.environ.get("NKU_USERNAME")
+    password = argv[2] if len(argv) > 2 else os.environ.get("NKU_PASSWORD")
+    return user, password
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
+    username, password = cli_credentials(sys.argv)
+    if not username or not password:
         print("Usage: python3 login.py <username> <password>")
+        print("   or: NKU_USERNAME=... NKU_PASSWORD=... python3 login.py")
         sys.exit(1)
-    sys.exit(login(sys.argv[1], sys.argv[2]))
+    sys.exit(login(username, password))

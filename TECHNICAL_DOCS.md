@@ -45,6 +45,11 @@
   dr1003({"result":0,"msg":"Welcome to Drcom System:3365972160","ret_code":1});
   ```
   （数字为 NAS IP 的十进制形式；`result` 恒为 0，**以 msg 前缀判断成功**）
+- **成功响应（会话刷新式重复登录）**:
+  ```
+  dr1003({"result":0,"msg":"Portal协议认证成功!","ret_code":1});
+  ```
+  （已在线时再次登录返回；判定规则为 msg 含 `认证成功`）
 - **失败响应**:
   - 密码错误: `dr1003({"result":0,"msg":"统一身份认证验证失败","ret_code":1});`
   - 账号不存在/无法解码: `dr1003({"result":0,"msg":"无法获取用户认证账号!","ret_code":1});`
@@ -109,6 +114,6 @@
 
 ## 8. 流程总结
 1. **探测**: 本地检测 IP/MAC/IPv6，探测 `baidu` 判断认证状态
-2. **登录**: 构造 XOR 加密参数 GET `portal/login`，解析 JSONP，msg 前缀 `Welcome to Drcom System` 即成功
+2. **登录**: 构造 XOR 加密参数 GET `portal/login`，解析 JSONP，msg 前缀 `Welcome to Drcom System` 或含 `认证成功` 即成功
 3. **登出**: 构造 XOR 加密参数（含真实密码）GET `portal/logout`，`result:1` + `Radius注销成功！` 即成功
 4. **验证**: 登出后探测 `baidu` 应转为 302 或连接失败

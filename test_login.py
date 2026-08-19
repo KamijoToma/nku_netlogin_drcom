@@ -324,6 +324,32 @@ class RouteDetectionTests(unittest.TestCase):
         self.assertEqual(info["ip"], "10.22.3.4")
 
 
+class CliCredentialsTests(unittest.TestCase):
+    """README:91 promises env-var credentials; argv takes precedence."""
+
+    def test_argv_wins_over_env(self):
+        with mock.patch.dict("os.environ", {"NKU_USERNAME": "envu",
+                                            "NKU_PASSWORD": "envp"}):
+            self.assertEqual(login.cli_credentials(["login.py", "argu", "argp"]),
+                             ("argu", "argp"))
+
+    def test_env_fallback(self):
+        with mock.patch.dict("os.environ", {"NKU_USERNAME": "envu",
+                                            "NKU_PASSWORD": "envp"}):
+            self.assertEqual(login.cli_credentials(["login.py"]),
+                             ("envu", "envp"))
+
+    def test_missing_credentials(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(login.cli_credentials(["login.py"]), (None, None))
+
+    def test_extra_positional_args_rejected(self):
+        # Regression: the original __main__ required exactly 2 positional args.
+        self.assertEqual(
+            login.cli_credentials(["login.py", "user", "pass", "unexpected"]),
+            (None, None))
+
+
 class LogoutTests(unittest.TestCase):
     """logout.py regression coverage (it shares login.py's machinery)."""
 

@@ -23,13 +23,13 @@
 
 ## 快速开始
 
-无需安装依赖（Python 3.6+，macOS/Linux 均可运行，MAC 检测以 Linux 为主）。
+无需安装依赖（Python 3.7+，macOS/Linux 均可运行，MAC 检测以 Linux 为主）。
 
 #### 登录
 ```bash
 python3 login.py <学号> <密码>
 ```
-成功时输出 `Login succeeded.`（响应 msg 为 `Welcome to Drcom System:<NAS IP>`）。
+成功时输出 `Login succeeded.`（响应 msg 为 `Welcome to Drcom System:<NAS IP>`；会话刷新式重复登录为 `Portal协议认证成功!`）。
 
 #### 登出
 ```bash
