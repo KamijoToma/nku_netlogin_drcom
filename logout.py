@@ -13,10 +13,9 @@ Protocol verified live on the campus VLAN (LicheePi 4A, Aug 2026):
 """
 
 import sys
-import urllib.error
 
-from login import (PORTAL_PORT, detect_network_info, enc_pwd, get_key, http_get,
-                   jsonp_body, portal_url, probe_blocked)
+from login import (detect_network_info, enc_pwd, get_key, jsonp_body,
+                   portal_request, probe_blocked)
 
 LOGOUT_PATH = "/eportal/portal/logout"
 
@@ -48,15 +47,9 @@ def logout(username, password):
         ("jsVersion", "4.3"),
     ]
     qs = "&".join(f"{k}={enc_pwd(v, key)}" for k, v in params) + "&encrypt=1&v=1234&lang=zh"
-    url = portal_url(LOGOUT_PATH, qs)
-    if not url:
+    body = portal_request(LOGOUT_PATH, qs)
+    if body is None:
         print("Error: portal unreachable (DNS and known IPs failed).")
-        return 1
-
-    try:
-        body = http_get(url)
-    except (urllib.error.URLError, OSError) as e:
-        print(f"Error: {e}")
         return 1
 
     data = jsonp_body(body)

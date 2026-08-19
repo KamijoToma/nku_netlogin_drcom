@@ -31,9 +31,14 @@ PORTAL_PORT = 804
 LOGIN_PATH = "/eportal/portal/login"
 PROBE_HOST = "www.baidu.com"
 
-# Known portal IPs used when DNS is unreachable (e.g. AC black-holes it):
-# campus-internal AC gateway, public VIP.
-PORTAL_IP_CANDIDATES = ["198.18.0.7", "222.30.38.234"]
+# Known campus-internal AC gateway, used when DNS is unreachable (e.g. the
+# AC black-holes it). The public VIP 222.30.38.234 is NOT here on purpose:
+# it runs a separate session DB and cannot affect the campus VLAN session
+# (see TECHNICAL_DOCS.md), so it must never carry campus credentials.
+PORTAL_IP_CANDIDATES = ["198.18.0.7"]
+
+# Portal instances that must never receive campus login/logout requests.
+PUBLIC_PORTAL_IPS = frozenset({"222.30.38.234"})
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -147,37 +152,74 @@ def _read_mac(name):
         return ""
 
 
-def portal_endpoint(retries=15, retry_delay=20.0):
-    """Return a reachable portal endpoint ('ip') on PORTAL_PORT, or None.
+def portal_candidates():
+    """Ordered, deduplicated portal endpoint candidates.
 
-    Tries (per round): DNS result (bounded), default gateway, known campus
-    and public portal IPs -- each with a short TCP probe. After a logout the
-    AC black-holes the client (portal included) for a short window, so the
-    whole round is retried a few times before giving up.
+    Order: bounded DNS answer, known campus AC IPs, default gateway last
+    (off-campus the gateway is attacker territory; on-campus it is rarely
+    the portal). Public portal instances (separate session DB) are always
+    excluded, even when DNS resolves to them.
     """
-    for attempt in range(retries):
-        seen = []
-        cands = []
-        ip = resolve_bounded(PORTAL_HOST, PORTAL_PORT, timeout=3.0)
-        if ip:
+    cands, seen = [], set()
+
+    def add(ip):
+        if ip and ip not in seen and ip not in PUBLIC_PORTAL_IPS:
+            seen.add(ip)
             cands.append(ip)
-        cands.append(default_gateway())
-        cands.extend(PORTAL_IP_CANDIDATES)
-        for cand in cands:
-            if not cand or cand in seen:
-                continue
-            seen.append(cand)
+
+    add(resolve_bounded(PORTAL_HOST, PORTAL_PORT, timeout=3.0))
+    for ip in PORTAL_IP_CANDIDATES:
+        add(ip)
+    add(default_gateway())
+    return cands
+
+
+# Hard total budget for endpoint probing + request retries. The AC
+# black-holes the client (portal included) for a short window after a
+# logout, so requests are retried until this deadline.
+PORTAL_BUDGET = 300.0
+
+
+def portal_request(path, qs, budget=PORTAL_BUDGET, retry_delay=20.0):
+    """GET path?qs from a reachable portal endpoint; return body or None.
+
+    A candidate only counts when the actual HTTPS request succeeds: the AC
+    can pass TCP SYNs while dropping HTTP payloads (see TECHNICAL_DOCS.md),
+    so TCP-only probing would skip the very block window the retries exist
+    for. All waiting is truncated to the total budget.
+    """
+    url = f":{PORTAL_PORT}{path}?{qs}"
+    deadline = time.monotonic() + budget
+    attempt = 0
+    while True:
+        attempt += 1
+        if time.monotonic() >= deadline:
+            return None
+        for cand in portal_candidates():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
             try:
-                s = socket.create_connection((cand, PORTAL_PORT), timeout=2)
+                s = socket.create_connection((cand, PORTAL_PORT),
+                                             timeout=min(2.0, remaining))
                 s.close()
-                return cand
             except OSError:
                 continue
-        if attempt < retries - 1:
-            print(f"Portal unreachable (AC block window?), retrying in "
-                  f"{retry_delay:.0f}s... ({attempt + 1}/{retries - 1})")
-            time.sleep(retry_delay)
-    return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                return http_get(f"https://{cand}{url}",
+                                timeout=min(10.0, remaining))
+            except OSError:
+                continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        delay = min(retry_delay, remaining)
+        print(f"Portal unreachable (AC block window?), retrying in "
+              f"{delay:.0f}s... (round {attempt})")
+        time.sleep(delay)
 
 def detect_network_info():
     """Detect local IP/MAC/IPv6 and whether we are in the unauthenticated state.
@@ -260,14 +302,6 @@ def http_get(url, timeout=10):
         return e.read().decode("utf-8", "replace")
 
 
-def portal_url(path, qs):
-    """Build the portal URL on a reachable endpoint (DNS or fallback IP)."""
-    host = portal_endpoint()
-    if not host:
-        return None
-    return f"https://{host}:{PORTAL_PORT}{path}?{qs}"
-
-
 def login(username, password):
     info = detect_network_info()
     if info is None:
@@ -293,15 +327,9 @@ def login(username, password):
         ("jsVersion", "4.3"),
     ]
     qs = "&".join(f"{k}={enc_pwd(v, key)}" for k, v in params) + "&encrypt=1&v=1234&lang=zh"
-    url = portal_url(LOGIN_PATH, qs)
-    if not url:
+    body = portal_request(LOGIN_PATH, qs)
+    if body is None:
         print("Error: portal unreachable (DNS and known IPs failed).")
-        return 1
-
-    try:
-        body = http_get(url)
-    except (urllib.error.URLError, OSError) as e:
-        print(f"Error: {e}")
         return 1
 
     data = jsonp_body(body)
