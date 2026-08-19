@@ -60,9 +60,19 @@ def enc_pwd(value, key):
 
 
 def jsonp_body(text):
-    """Parse the JSON object out of a JSONP response like dr1003({...});"""
+    """Parse the JSON object out of a JSONP response like dr1003({...});
+
+    Returns None for non-JSONP input and for malformed JSON (truncated or
+    proxied error pages), so callers take the "Unexpected response" path
+    instead of crashing on JSONDecodeError.
+    """
     m = re.search(r"\((\{.*\})\)", text, re.S)
-    return json.loads(m.group(1)) if m else None
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
 
 
 def resolve_bounded(host, port, timeout=3.0):
