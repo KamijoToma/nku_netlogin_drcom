@@ -15,6 +15,7 @@ Protocol verified live on the campus VLAN (LicheePi 4A, Aug 2026):
   all name resolution runs in a bounded daemon thread.
 """
 
+import ipaddress
 import json
 import re
 import socket
@@ -99,6 +100,24 @@ def resolve_bounded(host, port, timeout=3.0):
             return result[0]
         time.sleep(0.1)
     return None
+def route_iface(target_ip):
+    """(iface, src) of the route toward target_ip, per `ip route get`.
+
+    `ip route get <ip>` asks the kernel for the route to the actual portal,
+    so TUN/proxy interfaces shadowing the plain default route cannot divert
+    the detected identity. (None, None) when unavailable.
+    """
+    try:
+        out = subprocess.run(["ip", "route", "get", target_ip],
+                             capture_output=True, text=True, timeout=3).stdout
+        parts = out.split()
+        dev = parts[parts.index("dev") + 1] if "dev" in parts else None
+        src = parts[parts.index("src") + 1] if "src" in parts else None
+        return dev, src
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None, None
+
+
 def default_iface():
     """Name of the interface carrying the default route (None if unavailable)."""
     try:
@@ -110,12 +129,15 @@ def default_iface():
                 return parts[parts.index("dev") + 1]
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         pass
+    return None
+
+
 def _first_global_v4_ifaces():
     """Interfaces with a global IPv4, virtual/bridge interfaces excluded."""
     skip = ("docker", "veth", "br-", "tailscale", "tailscale0", "tun", "tap",
             "Meta", "lo", "kube")
     try:
-        out = subprocess.run(["ip", "-o", "-4", "addr", "show"],
+        out = subprocess.run(["ip", "-o", "-4", "addr", "show", "scope", "global"],
                              capture_output=True, text=True, timeout=3).stdout
     except (OSError, subprocess.SubprocessError):
         return []
@@ -124,7 +146,13 @@ def _first_global_v4_ifaces():
         p = line.split()
         if len(p) >= 4 and "inet" in p:
             name = p[1]
-            if name.startswith(skip):
+            if name.startswith(skip) or name in ifaces:
+                continue
+            try:
+                addr = ipaddress.ip_address(p[p.index("inet") + 1].split("/")[0])
+            except ValueError:
+                continue
+            if addr.is_link_local or addr.is_loopback:
                 continue
             ifaces.append(name)
     return ifaces
@@ -229,19 +257,37 @@ def detect_network_info():
     info = {"ip": "", "ipv6": "", "mac": "", "blocked": None}
 
     try:
-        iface = default_iface()
+        # Egress toward the first trusted portal candidate (DNS answer is
+        # filtered, TUN/proxy-proof); falls back to the plain default route,
+        # then to any global-IPv4 interface.
+        iface = None
+        targets = portal_candidates()
+        if targets:
+            iface, src = route_iface(targets[0])
+            if iface and src:
+                info["ip"] = src
+        if not iface:
+            iface = default_iface()
         if not iface:
             alts = _first_global_v4_ifaces()
             iface = alts[0] if alts else None
         if iface:
             info["mac"] = _read_mac(iface)
-            out = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", iface],
-                                 capture_output=True, text=True, timeout=3).stdout
-            for line in out.splitlines():
-                p = line.split()
-                if "inet" in p:
-                    info["ip"] = p[p.index("inet") + 1].split("/")[0]
-                    break
+            if not info["ip"]:
+                out = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", iface],
+                                     capture_output=True, text=True, timeout=3).stdout
+                for line in out.splitlines():
+                    p = line.split()
+                    if "inet" in p:
+                        cand = p[p.index("inet") + 1].split("/")[0]
+                        try:
+                            addr = ipaddress.ip_address(cand)
+                        except ValueError:
+                            continue
+                        if addr.is_link_local or addr.is_loopback:
+                            continue
+                        info["ip"] = cand
+                        break
             # Global IPv6 on the same interface (skip link-local fe80::/10).
             out6 = subprocess.run(["ip", "-o", "-6", "addr", "show", "dev", iface],
                                   capture_output=True, text=True, timeout=3).stdout
@@ -249,9 +295,15 @@ def detect_network_info():
                 p = line.split()
                 if "inet6" in p:
                     addr = p[p.index("inet6") + 1].split("/")[0]
-                    if not addr.startswith("fe80") and addr not in ("::", "ff00::"):
-                        info["ipv6"] = addr
-                        break
+                    try:
+                        ip6 = ipaddress.ip_address(addr)
+                    except ValueError:
+                        continue
+                    if ip6.is_link_local or ip6.is_loopback \
+                            or ip6.is_unspecified or ip6.is_multicast:
+                        continue
+                    info["ipv6"] = addr
+                    break
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         pass
     if not info["ip"]:

@@ -195,6 +195,135 @@ class PortalRequestTests(unittest.TestCase):
         http_get.assert_not_called()
 
 
+class RouteDetectionTests(unittest.TestCase):
+    """M5/m4/fe80::/10: interface and address detection."""
+
+    ROUTE_GET = "198.18.0.7 via 10.22.0.1 dev wlan0 src 10.22.3.4 uid 1000"
+    ADDR_V4 = '2: wlan0    inet 10.22.3.4/22 brd 10.22.3.255 scope global wlan0'
+    ADDR_V6 = ("2: wlan0    inet6 fe90::a00:27ff:fe4d:9fae/64 scope link\n"
+               "2: wlan0    inet6 240e:390:123:4567::1/64 scope global")
+
+    def _run_cmd(self, argv, **kw):
+        if argv[:3] == ["ip", "route", "get"]:
+            return completed(argv, self.ROUTE_GET)
+        if argv[:3] == ["ip", "-o", "-4"]:
+            # Only answer for the interface that really carries the address.
+            return completed(argv, self.ADDR_V4 if "wlan0" in argv else "")
+        if argv[:3] == ["ip", "-o", "-6"]:
+            return completed(argv, self.ADDR_V6 if "wlan0" in argv else "")
+        if argv[:2] == ["ip", "route"]:
+            # Plain default route points at the TUN interface -- must be ignored
+            # in favor of the portal-targeted route lookup.
+            return completed(argv, "default dev tailscale0 scope link")
+        return completed(argv)
+
+    def test_egress_uses_portal_targeted_route_not_default(self):
+        with mock.patch.object(login, "portal_candidates",
+                               return_value=[CAMPUS_AC]), \
+             mock.patch.object(login.subprocess, "run",
+                               side_effect=self._run_cmd), \
+             mock.patch.object(login, "_read_mac",
+                               return_value="aa:bb:cc:dd:ee:ff"), \
+             mock.patch.object(login.socket, "socket",
+                               side_effect=OSError("no network in tests")), \
+             mock.patch.object(login, "probe_blocked", return_value=True):
+            info = login.detect_network_info()
+        self.assertIsNotNone(info)
+        self.assertEqual(info["ip"], "10.22.3.4")
+        self.assertEqual(info["mac"], "aabbccddeeff")
+
+    def test_route_detection_targets_trusted_candidate_not_raw_dns(self):
+        # DNS answer may be the (untrusted) public VIP or a hijack address;
+        # the route lookup must target the first *trusted* portal candidate.
+        calls = []
+
+        def run_cmd(argv, **kw):
+            calls.append(argv)
+            if argv[:3] == ["ip", "route", "get"]:
+                return completed(argv, "198.18.0.7 dev wlan0 src 10.22.3.4")
+            return completed(argv, "")
+
+        with mock.patch.object(login, "portal_candidates",
+                               return_value=[CAMPUS_AC, "10.22.0.1"]), \
+             mock.patch.object(login.subprocess, "run", side_effect=run_cmd), \
+             mock.patch.object(login, "_read_mac", return_value="aa:bb:cc:dd:ee:ff"), \
+             mock.patch.object(login, "probe_blocked", return_value=True):
+            info = login.detect_network_info()
+        route_gets = [c for c in calls if c[:3] == ["ip", "route", "get"]]
+        self.assertTrue(any(CAMPUS_AC in c for c in route_gets))
+        self.assertEqual(info["ip"], "10.22.3.4")
+
+    def test_route_iface_without_src_keeps_iface(self):
+        out = "198.18.0.7 via 10.22.0.1 dev wlan0"
+        with mock.patch.object(login.subprocess, "run",
+                               return_value=completed(["ip"], out)):
+            self.assertEqual(login.route_iface(CAMPUS_AC), ("wlan0", None))
+
+    def test_route_without_src_falls_back_to_addr_read(self):
+        # `ip route get` without a preferred source: keep the interface and
+        # read the IPv4 from `addr show` instead of giving up on the route.
+        def run_cmd(argv, **kw):
+            if argv[:3] == ["ip", "route", "get"]:
+                return completed(argv, "198.18.0.7 via 10.22.0.1 dev wlan0")
+            if argv[:3] == ["ip", "-o", "-4"]:
+                return completed(argv, "2: wlan0    inet 10.22.3.4/22 scope global")
+            if argv[:3] == ["ip", "-o", "-6"]:
+                return completed(argv, "")
+            return completed(argv, "")
+
+        with mock.patch.object(login, "portal_candidates",
+                               return_value=[CAMPUS_AC]), \
+             mock.patch.object(login.subprocess, "run", side_effect=run_cmd), \
+             mock.patch.object(login, "_read_mac", return_value="aa:bb:cc:dd:ee:ff"), \
+             mock.patch.object(login.socket, "socket",
+                               side_effect=OSError("no network in tests")), \
+             mock.patch.object(login, "probe_blocked", return_value=True):
+            info = login.detect_network_info()
+        self.assertEqual(info["ip"], "10.22.3.4")
+
+    def test_ipv6_link_local_fe90_is_excluded(self):
+        with mock.patch.object(login, "portal_candidates",
+                               return_value=[CAMPUS_AC]), \
+             mock.patch.object(login.subprocess, "run",
+                               side_effect=self._run_cmd), \
+             mock.patch.object(login, "_read_mac", return_value="aa:bb:cc:dd:ee:ff"), \
+             mock.patch.object(login.socket, "socket",
+                               side_effect=OSError("no network in tests")), \
+             mock.patch.object(login, "probe_blocked", return_value=True):
+            info = login.detect_network_info()
+        self.assertEqual(info["ipv6"], "240e:390:123:4567::1")
+
+    def test_first_global_v4_skips_link_local(self):
+        out = ("7: eth0    inet 169.254.23.7/16 brd 169.254.255.255 scope link eth0\n"
+               "9: wlan0    inet 10.22.3.4/22 brd 10.22.3.255 scope global wlan0")
+        with mock.patch.object(login.subprocess, "run",
+                               return_value=completed(["ip"], out)):
+            self.assertEqual(login._first_global_v4_ifaces(), ["wlan0"])
+
+    def test_iface_addr_read_skips_link_local(self):
+        # An interface owning both a link-local and a global address must not
+        # report the 169.254 one even when it is listed first.
+        def run_cmd(argv, **kw):
+            if argv[:2] == ["ip", "route"]:
+                return completed(argv, "default via 10.22.0.1 dev eth0")
+            if argv[:3] == ["ip", "-o", "-4"]:
+                return completed(argv,
+                                 "5: eth0    inet 169.254.23.7/16 scope link\n"
+                                 "5: eth0    inet 10.22.3.4/22 scope global")
+            if argv[:3] == ["ip", "-o", "-6"]:
+                return completed(argv, "")
+            return completed(argv, "")
+
+        with mock.patch.object(login, "portal_candidates", return_value=[]), \
+             mock.patch.object(login.subprocess, "run", side_effect=run_cmd), \
+             mock.patch.object(login, "_read_mac", return_value="aa:bb:cc:dd:ee:ff"), \
+             mock.patch.object(login.socket, "socket",
+                               side_effect=OSError("no network in tests")), \
+             mock.patch.object(login, "probe_blocked", return_value=True):
+            info = login.detect_network_info()
+        self.assertEqual(info["ip"], "10.22.3.4")
+
+
 class LogoutTests(unittest.TestCase):
     """logout.py regression coverage (it shares login.py's machinery)."""
 
