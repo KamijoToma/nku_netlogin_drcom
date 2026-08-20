@@ -1,0 +1,12 @@
+[Unit]
+Description=Check NKU device connectivity every two minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15s
+Persistent=true
+Unit=nku-online.service
+
+[Install]
+WantedBy=timers.target

@@ -20,6 +20,9 @@
 | `login.py` | 登录脚本（同时提供共享的检测/加密函数） |
 | `logout.py` | 登出脚本 |
 | `TECHNICAL_DOCS.md` | 详细技术文档（含实测协议、响应格式、已知坑） |
+| `nku_online.py` | 基于 Tailscale 探测的 Wi-Fi 自动恢复守护脚本 |
+| `systemd/nku-online.service` | 单次在线检查与恢复任务 |
+| `systemd/nku-online.timer` | 每两分钟触发一次检查 |
 
 ## 快速开始
 
@@ -42,6 +45,51 @@ python3 logout.py <学号> <密码>
 python3 login.py <学号> <密码>
 python3 logout.py <学号> <密码>
 ```
+
+## Always Online 守护
+
+`nku_online.py` 并行探测所有在线的 Tailscale 对端；任意一个对端可达即认为网络正常。
+连续两轮全部失败后，按以下顺序恢复：
+
+1. 重启 `tailscaled`
+2. 关闭并重新开启 Wi-Fi，无线网卡重新连接当前 NetworkManager 配置
+3. 在 `Xiaomi_NKU`、`NKU_WLAN` 之间切换
+4. `NKU_WLAN` 连接后仍不可达时调用同目录 `login.py` 认证；仍失败则更换该配置的
+   本地管理单播 MAC，重新连接并再次认证
+5. 全部失败时恢复到首选配置 `Xiaomi_NKU`；不会修改该私有网络配置的 MAC
+
+安装到使用 NetworkManager、systemd 和 Tailscale 的 Linux 设备：
+
+```bash
+sudo install -d -m 0755 /opt/nku-online
+sudo install -m 0755 login.py nku_online.py /opt/nku-online/
+sudo install -m 0644 systemd/nku-online.service systemd/nku-online.timer /etc/systemd/system/
+sudo install -m 0600 /dev/null /etc/nku-online.env
+sudoedit /etc/nku-online.env
+```
+
+`/etc/nku-online.env` 仅由 root 读取：
+
+```ini
+NKU_USERNAME=<学号>
+NKU_PASSWORD=<密码>
+```
+
+启用并检查：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now nku-online.timer
+/opt/nku-online/nku_online.py --probe
+systemctl list-timers nku-online.timer
+```
+
+`--probe` 只检查、不修改网络；`--force-recovery` 会执行完整恢复序列，切换 Wi-Fi
+并修改 `NKU_WLAN` 的克隆 MAC，仅用于受控验证。接口、配置名、探测目标和等待时间均可在
+`/etc/nku-online.env` 中通过 `WIFI_INTERFACE`、`WIFI_PROFILES`、
+`PREFERRED_WIFI`、`TAILSCALE_TARGETS`、`FAILURE_CONFIRM_DELAY`、
+`WIFI_SETTLE_DELAY` 和 `NKU_AUTH_TIMEOUT` 覆盖。门户认证默认最多运行 75 秒，
+避免认证端点不可达时阻塞后续 Wi-Fi 恢复阶段。
 
 ## 技术细节
 
@@ -88,7 +136,7 @@ A: 可以（IP 探测为跨平台实现；MAC 检测在无 `/sys` 时回退到 `
 
 ⚠️ **注意事项：**
 - 不要在公共环境或不信任的计算机上运行此脚本
-- 避免硬编码密码，建议通过命令行参数或环境变量传入
+- 不要硬编码或提交密码；守护任务的凭据仅存放在权限为 `0600` 的 `/etc/nku-online.env`
 - 此工具仅供个人学习和网络维护使用
 - 遵守学校网络使用政策
 

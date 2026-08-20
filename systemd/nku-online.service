@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep NKU device reachable through Tailscale
+After=NetworkManager.service tailscaled.service
+Wants=NetworkManager.service tailscaled.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/nku-online.env
+ExecStart=/usr/bin/python3 /opt/nku-online/nku_online.py
+TimeoutStartSec=20min
+Nice=10
